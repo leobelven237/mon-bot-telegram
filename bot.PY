@@ -73,8 +73,8 @@ async def check_rewards(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> Non
         await context.bot.send_message(
             chat_id=user_id,
             text="🎉 Félicitations ! Accès VIP activé.\n"
-                 "🔑 Identifiants : user_12345 | pass_12345\n\n"
-                 "⚠️ Usage strictement personnel."
+                 "ouvre ce site dans ton navigateur et tu aura toutes les chaines du monde\n\n"
+                 "kool.to"
         )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
