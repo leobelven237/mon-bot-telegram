@@ -1,227 +1,347 @@
-import logging
+# -*- coding: utf-8 -*-
+import os
 import sqlite3
-from urllib.parse import quote_plus
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    MessageHandler,
-    filters
-)
-from telegram.error import BadRequest
+from datetime import datetime, timedelta
+from functools import wraps
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.helpers import escape_markdown
 
-# ---------------------------- CONFIGURATION ----------------------------
-TOKEN = "8056782510:AAE3LXIKiAHBevVt6jHGpzrXOGgErfVfpOE"  # Token du bot
-CHANNEL_ID = "@NETFLIXSERIE2"  # Nom du canal (avec @)
-CHANNEL_LINK = CHANNEL_ID.replace('@', '')  # Lien correct sans '@'
-REQUIRED_REFERRALS = 10       # Nombre d'invitations nécessaires
-PHOTO_ID = "AgACAgQAAxkBAAM3Z_q4jHpOferv__bAl7GUDkLUXG4AAk7HMRtg1NhTp7sdBvO5nHEBAAMCAAN5AAM2BA"  # ID de l'image d'accueil
-# -------------------------------------------------------------------------
+# ---------------- CONFIGURATION ----------------
+TOKEN = "7564498138:AAGqOyK6wQSQS51guGx_Uq74iMUDER3PpSI"  # Token de votre bot
+SUPER_ADMIN_ID = 5295071762  # Votre ID Telegram exact
+DATA_DIR = "data"
+DB_FILE = "main.db"
+EXPIRY_DAYS = 30
+MIN_SEARCH_LENGTH = 3
+# ------------------------------------------------
 
-# Initialisation de la BDD SQLite (mode synchrone pour simplifier)
-conn = sqlite3.connect('users.db')
+# Initialisation de la base de données principale
+os.makedirs(DATA_DIR, exist_ok=True)
+conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cursor = conn.cursor()
-cursor.execute('''CREATE TABLE IF NOT EXISTS users 
-                (user_id INTEGER PRIMARY KEY, referrals INTEGER DEFAULT 0, has_joined BOOLEAN DEFAULT FALSE)''')
+cursor.executescript("""
+CREATE TABLE IF NOT EXISTS admins (
+    user_id       INTEGER PRIMARY KEY,
+    added_at      TEXT NOT NULL,
+    expires_at    TEXT NOT NULL,
+    channel_link  TEXT,
+    active        INTEGER NOT NULL DEFAULT 0,
+    is_superadmin INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS admin_requests (
+    user_id      INTEGER PRIMARY KEY,
+    requested_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS user_access (
+    user_id  INTEGER,
+    admin_id INTEGER,
+    PRIMARY KEY(user_id, admin_id)
+);
+""")
+conn.commit()
+# Inscrire le Super‑Admin
+now = datetime.utcnow().isoformat()
+cursor.execute(
+    "INSERT OR IGNORE INTO admins(user_id,added_at,expires_at,active,is_superadmin) VALUES(?,?,?,?,1)",
+    (SUPER_ADMIN_ID, now, (datetime.utcnow() + timedelta(days=EXPIRY_DAYS * 12)).isoformat(), 1)
+)
 conn.commit()
 
-# Configuration des logs
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO)
-logger = logging.getLogger(__name__)
+# ---------- DÉCORATEURS ----------
+def superadmin_only(func):
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id != SUPER_ADMIN_ID:
+            await update.message.reply_text("❌ Vous n'êtes pas le Super‑Admin.")
+            return
+        return await func(update, context)
+    return wrapper
 
-def get_main_menu_keyboard(referral_link: str) -> InlineKeyboardMarkup:
-    """
-    Renvoie le clavier principal avec :
-      - Bouton pour vérifier l'adhésion (callback)
-      - Bouton pour consulter les statistiques (callback)
-      - Bouton pour partager le lien qui ouvre l'interface de partage
-    """
-    # Encode le lien et le texte pour le partage
-    encoded_url = quote_plus(referral_link)
-    share_text = quote_plus("Voici mon lien de parrainage !")
-    share_url = f"https://t.me/share/url?url={encoded_url}&text={share_text}"
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Vérifier mon adhésion", callback_data="check_joined")],
-        [InlineKeyboardButton("📊 Statistiques", callback_data="stats")],
-        [InlineKeyboardButton("📤 Partager le lien", url=share_url)]
-    ])
-
-def get_back_keyboard() -> InlineKeyboardMarkup:
-    """Retourne un clavier avec un bouton 'Retour au menu'."""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔙 Retour au menu", callback_data="back_to_menu")]
-    ])
-
-async def check_channel_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Vérifie si l'utilisateur a rejoint le canal."""
-    try:
-        member = await context.bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
-        return member.status in ['member', 'administrator', 'owner', 'creator']
-    except Exception as e:
-        logger.error(f"Erreur de vérification : {e}")
-        return False
-
-async def check_rewards(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Vérifie si l'utilisateur remplit les conditions pour la récompense."""
-    cursor.execute("SELECT referrals, has_joined FROM users WHERE user_id = ?", (user_id,))
-    data = cursor.fetchone()
-    if data and data[0] >= REQUIRED_REFERRALS and data[1]:
-        await context.bot.send_message(
-            chat_id=user_id,
-            text="🎉 Félicitations ! Accès VIP activé.\n"
-                 "ouvre ce site dans ton navigateur et tu aura toutes les chaines du monde\n\n"
-                 "kool.to"
-        )
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Commande /start :
-      - Enregistre l'utilisateur et gère le parrainage s'il existe.
-      - Construit le lien de parrainage sous la forme https://t.me/<bot_username>?start=ref_<user_id>
-      - Envoie l'image d'accueil accompagnée d'un menu principal
-    """
-    user = update.effective_user
-    referral_code = f"ref_{user.id}"
-    referral_link = f"https://t.me/{context.bot.username}?start={referral_code}"
-    
-    # Enregistrement de l'utilisateur (INSERT OR IGNORE)
-    cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user.id,))
-    conn.commit()
-    
-    # Gestion du parrainage
-    if context.args and context.args[0].startswith("ref_"):
-        try:
-            referrer_id = int(context.args[0].split("_")[1])
-            if referrer_id != user.id:
-                cursor.execute("UPDATE users SET referrals = referrals + 1 WHERE user_id = ?", (referrer_id,))
-                conn.commit()
-                await check_rewards(referrer_id, context)
-        except Exception as e:
-            logger.error(f"Erreur lors du traitement du parrainage : {e}")
-    
-    await context.bot.send_photo(
-        chat_id=update.effective_chat.id,
-        photo=PHOTO_ID,
-        caption=f"📺 *Bienvenue {user.first_name} !* 📺\n\n"
-                "Obtenez un accès VIP à +5000 chaînes en HD/4K 🌍\n\n"
-                f"🎁 *Conditions* :\n"
-                f"1️⃣ Rejoignez notre chaîne ➜ [Lien du canal](https://t.me/{CHANNEL_LINK})\n"
-                f"2️⃣ Parrainez *{REQUIRED_REFERRALS} amis* avec votre lien\n\n"
-                f"🔗 *Votre lien* : `t.me/{context.bot.username}?start={referral_code}`\n\n"
-                "⚠️ Respectez les lois de votre pays.",
-        parse_mode="Markdown",
-        reply_markup=get_main_menu_keyboard(referral_link)
-    )
-
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Affiche les statistiques de parrainage avec un bouton de retour."""
-    user = update.effective_user
-    cursor.execute("SELECT referrals FROM users WHERE user_id = ?", (user.id,))
-    row = cursor.fetchone()
-    referrals = row[0] if row else 0
-    stats_text = (
-        f"📊 *Statistiques*\n\n"
-        f"➤ Invitations validées : {referrals}/{REQUIRED_REFERRALS}\n"
-        f"➤ Progression : {'🟩' * (referrals // 5)}{'⬜️' * (5 - (referrals // 5))}"
-    )
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=stats_text,
-        parse_mode="Markdown",
-        reply_markup=get_back_keyboard()
-    )
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Affiche un message d'aide avec un bouton de retour."""
-    help_text = (
-        "Les commandes disponibles sont :\n"
-        "/start - Menu principal\n"
-        "/stats - Statistiques de parrainage\n"
-        "/help - Aide et conditions"
-    )
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=help_text,
-        reply_markup=get_back_keyboard()
-    )
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Gère les interactions via les boutons inline et supprime le message actuel lors du retour au menu."""
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    user_id = user.id
-
-    if query.data == "check_joined":
-        if await check_channel_membership(user_id, context):
-            cursor.execute("UPDATE users SET has_joined = TRUE WHERE user_id = ?", (user_id,))
+def admin_only(func):
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        uid = update.effective_user.id
+        row = cursor.execute("SELECT expires_at,active FROM admins WHERE user_id=?", (uid,)).fetchone()
+        if not row:
+            await update.message.reply_text("❌ Vous n'êtes pas administrateur.")
+            return
+        expires_at, active = row
+        if datetime.utcnow() > datetime.fromisoformat(expires_at):
+            cursor.execute("UPDATE admins SET active=0 WHERE user_id=?", (uid,))
             conn.commit()
-            if query.message.caption:
-                await query.edit_message_caption(
-                    "✅ Vérification réussie ! Vous avez rejoint le canal.",
-                    reply_markup=get_back_keyboard()
-                )
-            else:
-                await query.edit_message_text(
-                    "✅ Vérification réussie ! Vous avez rejoint le canal.",
-                    reply_markup=get_back_keyboard()
-                )
-            await check_rewards(user_id, context)
-        else:
-            if query.message.caption:
-                await query.edit_message_caption(
-                    f"❌ Vous devez d'abord rejoindre le canal : https://t.me/{CHANNEL_LINK}",
-                    reply_markup=get_back_keyboard()
-                )
-            else:
-                await query.edit_message_text(
-                    f"❌ Vous devez d'abord rejoindre le canal : https://t.me/{CHANNEL_LINK}",
-                    reply_markup=get_back_keyboard()
-                )
-    elif query.data == "stats":
-        # Affiche les statistiques dans un nouveau message sans toucher au menu principal
-        cursor.execute("SELECT referrals FROM users WHERE user_id = ?", (user_id,))
-        row = cursor.fetchone()
-        referrals = row[0] if row else 0
-        stats_text = (
-            f"📊 *Statistiques*\n\n"
-            f"➤ Invitations validées : {referrals}/{REQUIRED_REFERRALS}\n"
-            f"➤ Progression : {'🟩' * (referrals // 5)}{'⬜️' * (5 - (referrals // 5))}"
+            await update.message.reply_text("❌ Votre accès admin a expiré.")
+            return
+        if not active:
+            await update.message.reply_text("❌ Votre accès admin est désactivé. Configurez votre canal avec /setchannel.")
+            return
+        return await func(update, context)
+    return wrapper
+
+# ---------- UTILITAIRE DB PAR ADMIN ----------
+def get_admin_db(admin_id: int):
+    path = os.path.join(DATA_DIR, f"{admin_id}.db")
+    init = not os.path.exists(path)
+    db = sqlite3.connect(path, check_same_thread=False)
+    if init:
+        db.executescript("""
+        CREATE TABLE media(
+            rowid       INTEGER PRIMARY KEY,
+            file_id     TEXT UNIQUE,
+            description TEXT,
+            saison      TEXT,
+            added_at    TEXT
+        );
+        CREATE VIRTUAL TABLE media_fts USING fts5(
+            description, saison,
+            content='media', content_rowid='rowid'
+        );
+        """)
+        db.commit()
+    return db
+
+# ---------- HANDLERS PUBLIC ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if args and args[0].startswith('access_'):
+        aid = int(args[0].split('_', 1)[1])
+        cursor.execute("INSERT OR IGNORE INTO user_access(user_id,admin_id) VALUES(?,?)", (update.effective_user.id, aid))
+        conn.commit()
+        await update.message.reply_text(f"✅ Accès à l'admin {aid} activé !")
+        return
+    user = update.effective_user
+    is_super = (user.id == SUPER_ADMIN_ID)
+    row = cursor.execute("SELECT active FROM admins WHERE user_id=?", (user.id,)).fetchone()
+    is_admin = bool(row and row[0])
+    lines = [
+        f"👋 Bienvenue, {user.first_name}sur la plus grande base de donnees de telegram ! Vous êtes *{'Super‑Admin' if is_super else 'Admin' if is_admin else 'Utilisateur'}*.",
+        "🔹 Public :",
+        f"• commande pour chercher un contenu /search <mot> — Recherche (min {MIN_SEARCH_LENGTH} caractères)",
+        "• /devenir_admin — Demander rôle admin devenire administrateur te permet de stocker tes donnees dans le bot pour contourner les restrictions sur les droit d'auteur et eviter la fermeture de plus tu peux restrindre l'acces de tons contenue uniquemet a tes abonneès et ainsi assure la croissance du canal fichiers pries en charge : MP4; AVI; MKV; MOV; FLV; WMV; EXE; ZIP; RAR; 7z",
+        "• /whoami — Voir votre rôle",
+        "• /help — Aide"
+    ]
+    if is_admin:
+        lines += [
+            "🔹 Admin :",
+            "• Envoyez vidéo/document vidéo/fichier avec description 'Titre|Saison'",
+            "• /setchannel <@canal>",
+            "• /mon_canal — Afficher canal",
+            "• /ma_base — Nombre médias",
+            "• /renewadmin — Renouveler accès"
+        ]
+    if is_super:
+        lines += [
+            "🔹 Super‑Admin :",
+            "• /list_requests   • /accepter_admin <id>",
+            "• /refuser_admin <id>   • /listadmins",
+            "• /addadmin <id>   • /revokeadmin <id>   • /renewadmin <id>"
+        ]
+    text = escape_markdown("\n".join(lines), version=2)
+    await update.message.reply_text(text, parse_mode='MarkdownV2')
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start(update, context)
+
+async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid == SUPER_ADMIN_ID:
+        role = 'Super‑Admin'
+    else:
+        row = cursor.execute("SELECT active FROM admins WHERE user_id=?", (uid,)).fetchone()
+        role = 'Admin' if (row and row[0]) else 'Utilisateur'
+    await update.message.reply_text(f"Vous êtes : {role} (ID: {uid})")
+
+async def devenir_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    now = datetime.utcnow().isoformat()
+    cursor.execute("INSERT OR IGNORE INTO admin_requests(user_id,requested_at) VALUES(?,?)", (uid, now))
+    conn.commit()
+    await update.message.reply_text("✅ Votre demande a été envoyée au Super Administrateur l'accés aux droits administrateur n'est pas gratuit mais vous pouvez demander une periode d'essai de 7 jours prix de l'abonnement 1500f contacte @LELOUCH0X .")
+    await context.bot.send_message(SUPER_ADMIN_ID, f"Demande admin de {uid} (@{update.effective_user.username})")
+
+async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    query = ' '.join(context.args).strip().lower()
+    if len(query) < MIN_SEARCH_LENGTH:
+        await update.message.reply_text(f"🔍 {MIN_SEARCH_LENGTH}+ caractères requis.")
+        return
+    rows = cursor.execute("SELECT admin_id FROM user_access WHERE user_id=?", (uid,)).fetchall()
+    if not rows:
+        await update.message.reply_text("❌ vous n'avez acce a la base de donne d'aucun administrateur. Utilisez `?start=access_<id>` pour activer.")
+        return
+    found = False
+    for (aid,) in rows:
+        ch = cursor.execute("SELECT channel_link FROM admins WHERE user_id=?", (aid,)).fetchone()[0]
+        if ch:
+            try:
+                mem = await context.bot.get_chat_member(chat_id=ch, user_id=uid)
+                if mem.status not in ('member','administrator','creator'):
+                    await update.message.reply_text(f"👥 Rejoignez @{ch} d'abord.")
+                    continue
+            except:
+                continue
+        db = get_admin_db(aid)
+        cur = db.execute(
+            "SELECT m.file_id, m.description, m.saison "
+            "FROM media m JOIN media_fts ON m.rowid = media_fts.rowid "
+            "WHERE media_fts MATCH ?", (f"{query}*",)
         )
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=stats_text,
-            parse_mode="Markdown",
-            reply_markup=get_back_keyboard()
-        )
-    elif query.data == "back_to_menu":
-        try:
-            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=query.message.message_id)
-        except Exception as e:
-            logger.error(f"Erreur lors de la suppression du message : {e}")
-        await start(update, context)
+        for fid, desc, s in cur:
+            await context.bot.send_document(chat_id=update.effective_chat.id, document=fid, caption=f"{desc}{f' (Saison {s})' if s else ''}")
+            found = True
+        db.close()
+    if not found:
+        await update.message.reply_text("🔍 Rien trouvé.")
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Gère les erreurs."""
-    logger.error(f"Erreur : {context.error}")
+# ---------- HANDLERS ADMIN ----------
+@admin_only
+async def setchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        return await update.message.reply_text("Usage : /setchannel <@canal>")
+    link = context.args[0].replace('https://t.me/', '').strip()
+    cursor.execute("UPDATE admins SET channel_link=?,active=1 WHERE user_id=?", (link, update.effective_user.id))
+    conn.commit()
+    await update.message.reply_text(f"✅ Canal @{link} défini.")
 
-def main() -> None:
-    """Lancement du bot."""
-    application = Application.builder().token(TOKEN).build()
+@admin_only
+async def mon_canal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    row = cursor.execute("SELECT channel_link FROM admins WHERE user_id=?", (update.effective_user.id,)).fetchone()
+    await update.message.reply_text(f"Canal : @{row[0]}" if row and row[0] else "vous devez definir le lien de votre canal.")
 
-    # Handlers
-    application.add_handler(CommandHandler('start', start))
-    application.add_handler(CommandHandler('stats', stats))
-    application.add_handler(CommandHandler('help', help_command))
-    application.add_handler(MessageHandler(filters.Regex(r'^/start ref_'), start))
-    application.add_handler(CallbackQueryHandler(button_handler))
-    application.add_error_handler(error_handler)
+@admin_only
+async def ma_base(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = get_admin_db(update.effective_user.id)
+    count = db.execute("SELECT COUNT(*) FROM media").fetchone()[0]
+    await update.message.reply_text(f"📂 Vous avez {count} médias enregistrés.")
 
-    application.run_polling()
+@admin_only
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.video:
+        return await update.message.reply_text("❌ Envoyez une vidéo avec description 'Titre|Saison'.")
+    desc = update.message.caption or ''
+    if not desc.strip():
+        return await update.message.reply_text("❌ Ajoutez une description 'Titre|Saison'.")
+    fid = update.message.video.file_id
+    db = get_admin_db(update.effective_user.id)
+    if db.execute("SELECT 1 FROM media WHERE file_id=?", (fid,)).fetchone():
+        return await update.message.reply_text("❌ Vidéo déjà ajoutée.")
+    titre, saison = (desc.split('|', 1) + [''])[:2]
+    db.execute("INSERT INTO media(file_id,description,saison,added_at) VALUES(?,?,?,?)",
+               (fid, titre.strip(), saison.strip(), datetime.utcnow().isoformat()))
+    db.execute("INSERT INTO media_fts(rowid,description,saison) VALUES((SELECT rowid FROM media ORDER BY rowid DESC LIMIT 1),?,?)",
+               (titre.strip(), saison.strip()))
+    db.commit()
+    await update.message.reply_text("✅ Vidéo ajoutée.")
+
+@admin_only
+async def handle_document_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document
+    if not doc.file_name.lower().endswith(('.avi','.mkv','.mp4','.mov','.flv','.wmv','.exe','.zip','.rar','.7z')):
+        return
+    desc = update.message.caption or ''
+    if not desc.strip():
+        return await update.message.reply_text("❌ Ajoutez une description 'Titre|Saison'.")
+    fid = doc.file_id
+    db = get_admin_db(update.effective_user.id)
+    if db.execute("SELECT 1 FROM media WHERE file_id=?", (fid,)).fetchone():
+        return await update.message.reply_text("❌ Fichier déjà ajouté.")
+    titre, saison = (desc.split('|', 1) + [''])[:2]
+    db.execute("INSERT INTO media(file_id,description,saison,added_at) VALUES(?,?,?,?)",
+               (fid, titre.strip(), saison.strip(), datetime.utcnow().isoformat()))
+    db.execute("INSERT INTO media_fts(rowid,description,saison) VALUES((SELECT rowid FROM media ORDER BY rowid DESC LIMIT 1),?,?)",
+               (titre.strip(), saison.strip()))
+    db.commit()
+    await update.message.reply_text("✅ Fichier ajouté.")
+
+# ---------- HANDLERS SUPER ADMIN ----------
+@superadmin_only
+async def list_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = cursor.execute("SELECT user_id,requested_at FROM admin_requests").fetchall()
+    if not rows:
+        await update.message.reply_text("Aucune demande en attente.")
+        return
+    text = "Demandes en attente :\n" + "\n".join(f"- {u} à {t}" for u,t in rows)
+    await update.message.reply_text(text)
+
+@superadmin_only
+async def accepter_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    new_id = int(context.args[0])
+    cursor.execute("DELETE FROM admin_requests WHERE user_id=?", (new_id,))
+    now_iso = datetime.utcnow().isoformat()
+    expires = (datetime.utcnow() + timedelta(days=EXPIRY_DAYS)).isoformat()
+    cursor.execute("INSERT OR REPLACE INTO admins(user_id,added_at,expires_at,active) VALUES(?,?,?,1)",
+                   (new_id, now_iso, expires))
+    conn.commit()
+    link = f"https://t.me/{context.bot.username}?start=access_{new_id}"
+    await context.bot.send_message(new_id, f"🎉 Vous êtes admin ! Partagez : {link}\n/setchannel <@canal>")
+    await update.message.reply_text(f"Admin {new_id} accepté.")
+
+@superadmin_only
+async def refuser_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rid = int(context.args[0])
+    cursor.execute("DELETE FROM admin_requests WHERE user_id=?", (rid,))
+    conn.commit()
+    await context.bot.send_message(rid, "❌ Votre demande a été refusée.")
+    await update.message.reply_text(f"Demande {rid} refusée.")
+
+@superadmin_only
+async def list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = cursor.execute("SELECT user_id,expires_at,active FROM admins WHERE is_superadmin=0").fetchall()
+    text = "Admins :\n" + "\n".join(f"- {u}: exp {e}, act={a}" for u,e,a in rows)
+    await update.message.reply_text(text)
+
+@superadmin_only
+async def addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = int(context.args[0])
+    now_iso = datetime.utcnow().isoformat()
+    expires = (datetime.utcnow() + timedelta(days=EXPIRY_DAYS)).isoformat()
+    cursor.execute("INSERT OR REPLACE INTO admins(user_id,added_at,expires_at,active) VALUES(?,?,?,1)", (uid, now_iso, expires))
+    conn.commit()
+    await update.message.reply_text(f"Admin {uid} ajouté.")
+
+@superadmin_only
+async def revokeadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    aid = int(context.args[0])
+    cursor.execute("UPDATE admins SET active=0 WHERE user_id=?", (aid,))
+    conn.commit()
+    await update.message.reply_text(f"Admin {aid} révoqué.")
+
+@superadmin_only
+async def renewadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    aid = int(context.args[0])
+    new_exp = (datetime.utcnow() + timedelta(days=EXPIRY_DAYS)).isoformat()
+    cursor.execute("UPDATE admins SET expires_at=?,active=1 WHERE user_id=?", (new_exp, aid))
+    conn.commit()
+    await update.message.reply_text(f"Admin {aid} renouvelé jusqu'au {new_exp}.")
+
+# ---------- ENREGISTREMENT DES HANDLERS ET LANCEMENT ----------
+def main():
+    app = Application.builder().token(TOKEN).build()
+    # Public handlers
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("whoami", whoami))
+    app.add_handler(CommandHandler("devenir_admin", devenir_admin))
+    app.add_handler(CommandHandler("search", search))
+    # Admin handlers
+    app.add_handler(CommandHandler("setchannel", setchannel))
+    app.add_handler(CommandHandler("mon_canal", mon_canal))
+    app.add_handler(CommandHandler("ma_base", ma_base))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document_video))
+    app.add_handler(MessageHandler(filters.VIDEO, handle_video))
+    app.add_handler(CommandHandler("renewadmin", renewadmin))
+    # Super‑Admin handlers
+    app.add_handler(CommandHandler("list_requests", list_requests))
+    app.add_handler(CommandHandler("accepter_admin", accepter_admin))
+    app.add_handler(CommandHandler("refuser_admin", refuser_admin))
+    app.add_handler(CommandHandler("listadmins", list_admins))
+    app.add_handler(CommandHandler("addadmin", addadmin))
+    app.add_handler(CommandHandler("revokeadmin", revokeadmin))
+    app.add_handler(CommandHandler("renewadmin", renewadmin))
+
+    print("🤖 Bot lancé…")
+    app.run_polling()
 
 if __name__ == '__main__':
     main()
